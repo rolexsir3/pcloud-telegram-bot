@@ -1,8 +1,8 @@
 """
-Telegram -> pCloud uploader bot (Telethon, MTProto, files up to 2 GB).
+Telegram -> Filen uploader bot (Telethon, MTProto, files up to 2 GB).
 
 Workflow:
-  /newfolder Trip 2026   -> creates the folder in pCloud and makes it active
+  /newfolder Trip 2026   -> creates the folder in Filen and makes it active
   (send or forward photos / videos / albums)  -> uploaded into the active folder
   /done                  -> shows a summary and closes the folder
 """
@@ -12,11 +12,11 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 from collections import defaultdict
 from pathlib import Path
 
-import requests
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 
@@ -33,92 +33,59 @@ ALLOWED = {
 if not ALLOWED:
     raise SystemExit("Set ALLOWED_USER_IDS in .env (comma separated Telegram user IDs).")
 
-PC_USER = os.environ["PCLOUD_USERNAME"]
-PC_PASS = os.environ["PCLOUD_PASSWORD"]
-PC_HOST = os.getenv("PCLOUD_HOST", "api.pcloud.com")  # EU accounts: eapi.pcloud.com
-PC_ROOT = "/" + os.getenv("PCLOUD_ROOT", "Telegram").strip("/")
+RCLONE_BIN = os.getenv("RCLONE_BIN", "rclone")
+RCLONE_REMOTE = os.getenv("RCLONE_REMOTE", "filen").strip().rstrip(":")
+ROOT = os.getenv("STORAGE_ROOT", "Telegram").strip("/")  # top-level folder in Filen
 
-TMP_DIR = Path(os.getenv("TMP_DIR", tempfile.gettempdir())) / "tg_pcloud_bot"
+TMP_DIR = Path(os.getenv("TMP_DIR", tempfile.gettempdir())) / "tg_filen_bot"
 STATE_FILE = Path(os.getenv("STATE_FILE", "state.json"))
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO
 )
-log = logging.getLogger("pcloud-bot")
+log = logging.getLogger("filen-bot")
 
-# ----------------------------------------------------------------- pCloud ---
-AUTH_ERRORS = {1000, 2000, 2094}  # login required / invalid token
+# ---------------------------------------------------------- storage (rclone) ---
+class RcloneStorage:
+    """Talks to Filen (or any rclone remote) by calling the rclone binary.
+    rclone handles the end-to-end encryption, chunking and retries."""
 
+    def _remote(self, path):
+        return f"{RCLONE_REMOTE}:{path.strip('/')}"
 
-class PCloud:
-    def __init__(self):
-        self.auth = None
-        self.http = requests.Session()
-
-    def _url(self, method):
-        return f"https://{PC_HOST}/{method}"
-
-    def login(self):
-        r = self.http.get(
-            self._url("userinfo"),
-            params={"getauth": 1, "username": PC_USER, "password": PC_PASS},
-            timeout=60,
+    def _run(self, *args, timeout=None):
+        return subprocess.run(
+            [RCLONE_BIN, *args], capture_output=True, text=True, timeout=timeout
         )
-        data = r.json()
-        if data.get("result") != 0:
-            raise RuntimeError(f"pCloud login failed: {data.get('error')} ({data.get('result')})")
-        self.auth = data["auth"]
-        log.info("Logged in to pCloud")
 
-    def call(self, method, **params):
-        for attempt in (1, 2):
-            if not self.auth:
-                self.login()
-            r = self.http.get(
-                self._url(method), params={**params, "auth": self.auth}, timeout=60
+    def check(self):
+        """Startup check: rclone installed and the remote reachable."""
+        try:
+            r = self._run("lsd", f"{RCLONE_REMOTE}:", timeout=120)
+        except FileNotFoundError:
+            raise RuntimeError(f"rclone not found (RCLONE_BIN={RCLONE_BIN}). Install rclone first.")
+        if r.returncode != 0:
+            raise RuntimeError(
+                f"Cannot reach rclone remote '{RCLONE_REMOTE}': {r.stderr.strip() or r.stdout.strip()}"
             )
-            data = r.json()
-            if data.get("result") in AUTH_ERRORS and attempt == 1:
-                self.auth = None
-                continue
-            return data
+        log.info("rclone remote '%s' OK", RCLONE_REMOTE)
 
     def ensure_folder(self, path):
-        data = self.call("createfolderifnotexists", path=path)
-        if data.get("result") != 0:
-            raise RuntimeError(f"Cannot create folder {path}: {data.get('error')}")
+        r = self._run("mkdir", self._remote(path), timeout=300)
+        if r.returncode != 0:
+            raise RuntimeError(f"Cannot create folder {path}: {r.stderr.strip()[-300:]}")
 
     def folder_exists(self, path):
-        return self.call("listfolder", path=path, nofiles=1).get("result") == 0
+        return self._run("lsf", self._remote(path), timeout=300).returncode == 0
 
     def upload(self, folder_path, local_path, filename):
-        """Stream a file to pCloud with a PUT request (no full-file RAM load)."""
-        for attempt in (1, 2):
-            if not self.auth:
-                self.login()
-            with open(local_path, "rb") as f:
-                r = self.http.put(
-                    self._url("uploadfile"),
-                    params={
-                        "auth": self.auth,
-                        "path": folder_path,
-                        "filename": filename,
-                        "nopartial": 1,
-                        "renameifexists": 1,
-                    },
-                    data=f,
-                    timeout=(30, 3600),
-                )
-            data = r.json()
-            if data.get("result") in AUTH_ERRORS and attempt == 1:
-                self.auth = None
-                continue
-            if data.get("result") != 0:
-                raise RuntimeError(f"Upload failed: {data.get('error')} ({data.get('result')})")
-            return
+        dest = self._remote(f"{folder_path}/{filename}")
+        r = self._run("copyto", local_path, dest, "--retries", "3", "--low-level-retries", "5")
+        if r.returncode != 0:
+            raise RuntimeError(f"Upload failed: {r.stderr.strip()[-300:]}")
 
 
-pc = PCloud()
+store = RcloneStorage()
 
 # ------------------------------------------------------------------ state ---
 def load_state():
@@ -168,7 +135,7 @@ def make_filename(msg, kind):
 
 
 HELP = (
-    "Send /newfolder <name> to create a folder in pCloud, then send or forward "
+    "Send /newfolder <name> to create a folder in Filen, then send or forward "
     "photos, videos and albums. Everything goes into that folder.\n\n"
     "/newfolder <name> - create a folder and make it active\n"
     "/setfolder <name> - switch to an existing folder\n"
@@ -177,7 +144,7 @@ HELP = (
 )
 
 # ----------------------------------------------------------------- client ---
-client = TelegramClient("pcloud_bot_session", API_ID, API_HASH)
+client = TelegramClient("filen_bot_session", API_ID, API_HASH)
 
 queue: asyncio.Queue = asyncio.Queue()
 pending = defaultdict(int)  # user_id -> number of queued/running batches
@@ -212,11 +179,11 @@ async def cmd_newfolder(event):
     if not name:
         return await event.reply("Usage: /newfolder <name>")
     try:
-        await asyncio.to_thread(pc.ensure_folder, PC_ROOT)
-        await asyncio.to_thread(pc.ensure_folder, f"{PC_ROOT}/{name}")
+        await asyncio.to_thread(store.ensure_folder, ROOT)
+        await asyncio.to_thread(store.ensure_folder, f"{ROOT}/{name}")
     except Exception as e:
         log.exception("newfolder failed")
-        return await event.reply(f"pCloud error: {e}")
+        return await event.reply(f"Storage error: {e}")
     state["active"][str(event.sender_id)] = name
     state["stats"].setdefault(str(event.sender_id), {}).setdefault(name, {"photo": 0, "video": 0})
     save_state()
@@ -229,7 +196,7 @@ async def cmd_setfolder(event):
     name = clean_name(event.pattern_match.group(1) or "")
     if not name:
         return await event.reply("Usage: /setfolder <name>")
-    exists = await asyncio.to_thread(pc.folder_exists, f"{PC_ROOT}/{name}")
+    exists = await asyncio.to_thread(store.folder_exists, f"{ROOT}/{name}")
     if not exists:
         return await event.reply(f"Folder not found: {name}\nCreate it with /newfolder {name}")
     state["active"][str(event.sender_id)] = name
@@ -301,14 +268,14 @@ async def worker():
             res["folders"].append(folder)
         tmp = Path(tempfile.mkdtemp(dir=TMP_DIR))
         try:
-            await asyncio.to_thread(pc.ensure_folder, f"{PC_ROOT}/{folder}")
+            await asyncio.to_thread(store.ensure_folder, f"{ROOT}/{folder}")
             for m in msgs:
                 kind = media_kind(m)
                 name = make_filename(m, kind)
                 local = tmp / name
                 try:
                     await client.download_media(m, file=str(local))
-                    await asyncio.to_thread(pc.upload, f"{PC_ROOT}/{folder}", str(local), name)
+                    await asyncio.to_thread(store.upload, f"{ROOT}/{folder}", str(local), name)
                     res["ok"] += 1
                     s = state["stats"].setdefault(str(uid), {}).setdefault(folder, {"photo": 0, "video": 0})
                     s[kind] += 1
@@ -341,7 +308,7 @@ async def worker():
 async def main():
     shutil.rmtree(TMP_DIR, ignore_errors=True)
     TMP_DIR.mkdir(parents=True, exist_ok=True)
-    await asyncio.to_thread(pc.login)
+    await asyncio.to_thread(store.check)
     await client.start(bot_token=BOT_TOKEN)
     asyncio.create_task(worker())
     me = await client.get_me()
