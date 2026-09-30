@@ -1,0 +1,4 @@
+telethon>=1.36
+requests>=2.31
+python-dotenv>=1.0
+cryptg>=0.4

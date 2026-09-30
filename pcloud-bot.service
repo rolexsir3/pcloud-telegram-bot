@@ -1,0 +1,15 @@
+[Unit]
+Description=Telegram to pCloud uploader bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/pcloud-telegram-bot
+ExecStart=/opt/pcloud-telegram-bot/venv/bin/python bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
