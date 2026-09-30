@@ -36,6 +36,9 @@ if not ALLOWED:
 RCLONE_BIN = os.getenv("RCLONE_BIN", "rclone")
 RCLONE_REMOTE = os.getenv("RCLONE_REMOTE", "filen").strip().rstrip(":")
 ROOT = os.getenv("STORAGE_ROOT", "Telegram").strip("/")  # top-level folder in Filen
+# Filen caps each single upload at ~2 MiB/s, but parallel uploads add up,
+# so several files are processed at the same time.
+PARALLEL = max(1, int(os.getenv("PARALLEL_UPLOADS", "4")))
 
 TMP_DIR = Path(os.getenv("TMP_DIR", tempfile.gettempdir())) / "tg_filen_bot"
 STATE_FILE = Path(os.getenv("STATE_FILE", "state.json"))
@@ -242,8 +245,9 @@ async def enqueue(event, msgs):
     if not name:
         return await event.reply("Create a folder first: /newfolder <name>")
     first = pending[uid] == 0
-    pending[uid] += 1
-    await queue.put((uid, event.chat_id, name, msgs))
+    pending[uid] += len(msgs)
+    for m in msgs:
+        await queue.put((uid, event.chat_id, name, m))
     if first:
         await event.reply(f"Uploading to {name} ...")
 
@@ -260,48 +264,50 @@ async def on_single(event):
 
 
 # ----------------------------------------------------------------- worker ---
-async def worker():
+async def process_file(uid, folder, m):
+    """Download one Telegram file, upload it to Filen, clean up. Returns True on success."""
+    kind = media_kind(m)
+    name = make_filename(m, kind)
+    tmp = Path(tempfile.mkdtemp(dir=TMP_DIR))
+    local = tmp / name
+    try:
+        await client.download_media(m, file=str(local))
+        await asyncio.to_thread(store.upload, f"{ROOT}/{folder}", str(local), name)
+        s = state["stats"].setdefault(str(uid), {}).setdefault(folder, {"photo": 0, "video": 0})
+        s[kind] += 1
+        save_state()
+        return True
+    except Exception:
+        log.exception("Failed on message %s", m.id)
+        return False
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+async def worker(n):
     while True:
-        uid, chat_id, folder, msgs = await queue.get()
+        uid, chat_id, folder, m = await queue.get()
         res = results[uid]
         if folder not in res["folders"]:
             res["folders"].append(folder)
-        tmp = Path(tempfile.mkdtemp(dir=TMP_DIR))
         try:
-            await asyncio.to_thread(store.ensure_folder, f"{ROOT}/{folder}")
-            for m in msgs:
-                kind = media_kind(m)
-                name = make_filename(m, kind)
-                local = tmp / name
-                try:
-                    await client.download_media(m, file=str(local))
-                    await asyncio.to_thread(store.upload, f"{ROOT}/{folder}", str(local), name)
-                    res["ok"] += 1
-                    s = state["stats"].setdefault(str(uid), {}).setdefault(folder, {"photo": 0, "video": 0})
-                    s[kind] += 1
-                    save_state()
-                except Exception:
-                    log.exception("Failed on message %s", m.id)
-                    res["fail"] += 1
-                finally:
-                    local.unlink(missing_ok=True)
+            ok = await process_file(uid, folder, m)
         except Exception:
-            log.exception("Batch failed")
-            res["fail"] += len(msgs)
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
-            pending[uid] -= 1
-            if pending[uid] <= 0:
-                pending[uid] = 0
-                text = f"Uploaded {res['ok']} file(s) to {', '.join(res['folders'])}."
-                if res["fail"]:
-                    text += f"\n{res['fail']} file(s) failed, check the logs."
-                results.pop(uid, None)
-                try:
-                    await client.send_message(chat_id, text)
-                except Exception:
-                    log.exception("Could not send summary")
-            queue.task_done()
+            log.exception("Worker %s crashed on a file", n)
+            ok = False
+        res["ok" if ok else "fail"] += 1
+        pending[uid] -= 1
+        if pending[uid] <= 0:
+            pending[uid] = 0
+            text = f"Uploaded {res['ok']} file(s) to {', '.join(res['folders'])}."
+            if res["fail"]:
+                text += f"\n{res['fail']} file(s) failed, check the logs."
+            results.pop(uid, None)
+            try:
+                await client.send_message(chat_id, text)
+            except Exception:
+                log.exception("Could not send summary")
+        queue.task_done()
 
 
 # ------------------------------------------------------------------- main ---
@@ -310,9 +316,10 @@ async def main():
     TMP_DIR.mkdir(parents=True, exist_ok=True)
     await asyncio.to_thread(store.check)
     await client.start(bot_token=BOT_TOKEN)
-    asyncio.create_task(worker())
+    for n in range(PARALLEL):
+        asyncio.create_task(worker(n))
     me = await client.get_me()
-    log.info("Bot @%s is running", me.username)
+    log.info("Bot @%s is running (%d parallel uploads)", me.username, PARALLEL)
     await client.run_until_disconnected()
 
 
